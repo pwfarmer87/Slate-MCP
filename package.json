@@ -1,7 +1,7 @@
 {
   "name": "slate-mcp-server",
-  "version": "1.0.0",
-  "description": "MCP server for connecting Technolutions Slate with Claude - enables student enrollment demographics reporting",
+  "version": "1.1.0",
+  "description": "MCP server for connecting Technolutions Slate with Claude - enables student enrollment demographics reporting and course feedback collection/analysis",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -21,7 +21,10 @@
     "enrollment",
     "demographics",
     "higher-education",
-    "claude"
+    "claude",
+    "student-feedback",
+    "course-evaluation",
+    "feedback-analysis"
   ],
   "author": "",
   "license": "MIT",

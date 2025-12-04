@@ -28,6 +28,24 @@ import {
   DiversityMetrics,
   YearOverYearComparison,
 } from './types.js';
+import {
+  Course,
+  CourseFeedback,
+  FeedbackRatings,
+  SubmitFeedbackRequest,
+  FeedbackQueryParams,
+  ValidationResult,
+} from './feedback-types.js';
+import { FeedbackStore } from './feedback-store.js';
+import {
+  generateCourseFeedbackSummary,
+  generateInstructorFeedbackSummary,
+  generateDepartmentFeedbackSummary,
+  generateFeedbackTrends,
+  formatCourseFeedbackReport,
+  formatInstructorFeedbackReport,
+  formatDepartmentFeedbackReport,
+} from './feedback-analysis.js';
 
 // Load configuration from environment variables
 function loadConfig(): SlateConfig {
@@ -235,6 +253,284 @@ const tools: Tool[] = [
       },
     },
   },
+  // Student Feedback Tools
+  {
+    name: 'add_course',
+    description:
+      'Add a new course to the feedback system. Creates a course that students can submit feedback for.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: {
+          type: 'string',
+          description: 'Course code (e.g., "CS101")',
+        },
+        name: {
+          type: 'string',
+          description: 'Full course name (e.g., "Introduction to Computer Science")',
+        },
+        department: {
+          type: 'string',
+          description: 'Department offering the course (e.g., "Computer Science")',
+        },
+        term: {
+          type: 'string',
+          description: 'Term (e.g., "Fall", "Spring")',
+        },
+        year: {
+          type: 'number',
+          description: 'Academic year (e.g., 2024)',
+        },
+        instructor_name: {
+          type: 'string',
+          description: 'Name of the instructor',
+        },
+        instructor_id: {
+          type: 'string',
+          description: 'Unique identifier for the instructor',
+        },
+      },
+      required: ['code', 'name', 'department', 'term', 'year', 'instructor_name'],
+    },
+  },
+  {
+    name: 'submit_feedback',
+    description:
+      'Submit student feedback for a course. Includes ratings (1-5 scale) across multiple dimensions and optional comments.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        course_id: {
+          type: 'string',
+          description: 'The unique course ID to submit feedback for',
+        },
+        student_id: {
+          type: 'string',
+          description: 'Anonymous student identifier',
+        },
+        ratings: {
+          type: 'object',
+          description: 'Rating scores (1-5) for each category',
+          properties: {
+            overall: { type: 'number', description: 'Overall satisfaction (1-5)' },
+            content_quality: { type: 'number', description: 'Content quality (1-5)' },
+            instructor_effectiveness: { type: 'number', description: 'Instructor effectiveness (1-5)' },
+            course_difficulty: { type: 'number', description: 'Difficulty level (1=too easy, 3=right, 5=too hard)' },
+            workload_manageability: { type: 'number', description: 'Workload manageability (1-5)' },
+            learning_outcomes: { type: 'number', description: 'Learning outcomes achieved (1-5)' },
+            materials_quality: { type: 'number', description: 'Materials quality (1-5)' },
+            engagement_level: { type: 'number', description: 'Class engagement (1-5)' },
+          },
+          required: ['overall', 'content_quality', 'instructor_effectiveness', 'course_difficulty', 'workload_manageability', 'learning_outcomes', 'materials_quality', 'engagement_level'],
+        },
+        comments: {
+          type: 'object',
+          description: 'Optional text feedback',
+          properties: {
+            strengths: { type: 'string', description: 'What worked well in the course' },
+            improvements: { type: 'string', description: 'Areas for improvement' },
+            instructor_feedback: { type: 'string', description: 'Specific instructor feedback' },
+            additional_comments: { type: 'string', description: 'Any other comments' },
+          },
+        },
+        would_recommend: {
+          type: 'boolean',
+          description: 'Would the student recommend this course?',
+        },
+        anonymous: {
+          type: 'boolean',
+          description: 'Submit feedback anonymously (default: true)',
+          default: true,
+        },
+      },
+      required: ['course_id', 'student_id', 'ratings', 'would_recommend'],
+    },
+  },
+  {
+    name: 'get_course_feedback_summary',
+    description:
+      'Get a comprehensive feedback summary for a specific course, including average ratings, sentiment analysis, and key themes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        course_id: {
+          type: 'string',
+          description: 'The course ID to get feedback for',
+        },
+      },
+      required: ['course_id'],
+    },
+  },
+  {
+    name: 'get_course_feedback_report',
+    description:
+      'Generate a formatted, human-readable feedback report for a specific course.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        course_id: {
+          type: 'string',
+          description: 'The course ID to generate a report for',
+        },
+      },
+      required: ['course_id'],
+    },
+  },
+  {
+    name: 'get_instructor_feedback_summary',
+    description:
+      'Get feedback summary for an instructor across all their courses, including performance trends over time.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        instructor_id: {
+          type: 'string',
+          description: 'The instructor ID to get feedback for',
+        },
+      },
+      required: ['instructor_id'],
+    },
+  },
+  {
+    name: 'get_department_feedback_summary',
+    description:
+      'Get aggregated feedback summary for an entire department, including top and lowest-rated courses.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        department: {
+          type: 'string',
+          description: 'Department name to get feedback for',
+        },
+        term: {
+          type: 'string',
+          description: 'Filter by term (e.g., "Fall")',
+        },
+        year: {
+          type: 'number',
+          description: 'Filter by year',
+        },
+      },
+      required: ['department'],
+    },
+  },
+  {
+    name: 'get_feedback_trends',
+    description:
+      'Analyze feedback trends over time for a course, instructor, or department.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        course_id: {
+          type: 'string',
+          description: 'Course ID to analyze trends for',
+        },
+        instructor_id: {
+          type: 'string',
+          description: 'Instructor ID to analyze trends for',
+        },
+        department: {
+          type: 'string',
+          description: 'Department to analyze trends for',
+        },
+      },
+    },
+  },
+  {
+    name: 'list_courses',
+    description:
+      'List all courses in the feedback system, optionally filtered by department, term, or instructor.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        department: {
+          type: 'string',
+          description: 'Filter by department',
+        },
+        term: {
+          type: 'string',
+          description: 'Filter by term',
+        },
+        year: {
+          type: 'number',
+          description: 'Filter by year',
+        },
+        instructor_id: {
+          type: 'string',
+          description: 'Filter by instructor ID',
+        },
+      },
+    },
+  },
+  {
+    name: 'search_feedback',
+    description:
+      'Search and filter feedback submissions with various criteria.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        course_id: {
+          type: 'string',
+          description: 'Filter by course ID',
+        },
+        course_code: {
+          type: 'string',
+          description: 'Filter by course code',
+        },
+        instructor_id: {
+          type: 'string',
+          description: 'Filter by instructor ID',
+        },
+        department: {
+          type: 'string',
+          description: 'Filter by department',
+        },
+        term: {
+          type: 'string',
+          description: 'Filter by term',
+        },
+        year: {
+          type: 'number',
+          description: 'Filter by year',
+        },
+        min_rating: {
+          type: 'number',
+          description: 'Minimum overall rating (1-5)',
+        },
+        max_rating: {
+          type: 'number',
+          description: 'Maximum overall rating (1-5)',
+        },
+        has_comments: {
+          type: 'boolean',
+          description: 'Only return feedback with comments',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum results to return (default: 100)',
+          default: 100,
+        },
+      },
+    },
+  },
+  {
+    name: 'get_feedback_stats',
+    description:
+      'Get overall statistics about the feedback system including total courses, responses, and available filters.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'seed_sample_feedback_data',
+    description:
+      'Seed the feedback system with sample course and feedback data for testing and demonstration purposes.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
 ];
 
 // Create the server
@@ -251,6 +547,10 @@ const server = new Server(
 );
 
 let slateClient: SlateClient | null = null;
+
+// Initialize the Feedback store
+const feedbackDataPath = process.env.FEEDBACK_DATA_PATH || undefined;
+const feedbackStore = new FeedbackStore(feedbackDataPath);
 
 // Initialize the Slate client
 function getSlateClient(): SlateClient {
@@ -487,6 +787,260 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           totalMatching: students.length,
           returned: limitedStudents.length,
           students: limitedStudents,
+        };
+        break;
+      }
+
+      // Student Feedback Tool Handlers
+      case 'add_course': {
+        const code = args?.code as string;
+        const courseName = args?.name as string;
+        const department = args?.department as string;
+        const term = args?.term as string;
+        const year = args?.year as number;
+        const instructorName = args?.instructor_name as string;
+        const instructorId = (args?.instructor_id as string) || `instructor-${instructorName.toLowerCase().replace(/\s+/g, '-')}`;
+
+        const courseId = `${code.toLowerCase()}-${term.toLowerCase().charAt(0)}${year}`;
+        const course: Course = {
+          id: courseId,
+          code,
+          name: courseName,
+          department,
+          term,
+          year,
+          instructorId,
+          instructorName,
+        };
+
+        const addedCourse = feedbackStore.addCourse(course);
+        result = {
+          success: true,
+          message: `Course ${code} added successfully`,
+          course: addedCourse,
+        };
+        break;
+      }
+
+      case 'submit_feedback': {
+        const courseId = args?.course_id as string;
+        const studentId = args?.student_id as string;
+        const ratingsInput = args?.ratings as Record<string, number>;
+        const commentsInput = args?.comments as Record<string, string> | undefined;
+        const wouldRecommend = args?.would_recommend as boolean;
+        const anonymous = (args?.anonymous as boolean) ?? true;
+
+        // Map snake_case to camelCase for ratings
+        const ratings: FeedbackRatings = {
+          overall: ratingsInput.overall,
+          contentQuality: ratingsInput.content_quality,
+          instructorEffectiveness: ratingsInput.instructor_effectiveness,
+          courseDifficulty: ratingsInput.course_difficulty,
+          workloadManageability: ratingsInput.workload_manageability,
+          learningOutcomes: ratingsInput.learning_outcomes,
+          materialsQuality: ratingsInput.materials_quality,
+          engagementLevel: ratingsInput.engagement_level,
+        };
+
+        const comments = commentsInput ? {
+          strengths: commentsInput.strengths,
+          improvements: commentsInput.improvements,
+          instructorFeedback: commentsInput.instructor_feedback,
+          additionalComments: commentsInput.additional_comments,
+        } : undefined;
+
+        const feedbackResult = feedbackStore.submitFeedback({
+          courseId,
+          studentId,
+          ratings,
+          comments,
+          wouldRecommend,
+          anonymous,
+        });
+
+        if ('valid' in feedbackResult && !feedbackResult.valid) {
+          result = {
+            success: false,
+            errors: (feedbackResult as ValidationResult).errors,
+          };
+        } else {
+          result = {
+            success: true,
+            message: 'Feedback submitted successfully',
+            feedback: feedbackResult,
+          };
+        }
+        break;
+      }
+
+      case 'get_course_feedback_summary': {
+        const courseId = args?.course_id as string;
+        const summary = generateCourseFeedbackSummary(feedbackStore, courseId);
+
+        if (!summary) {
+          result = { error: `Course not found: ${courseId}` };
+        } else {
+          result = summary;
+        }
+        break;
+      }
+
+      case 'get_course_feedback_report': {
+        const courseId = args?.course_id as string;
+        const summary = generateCourseFeedbackSummary(feedbackStore, courseId);
+
+        if (!summary) {
+          result = { error: `Course not found: ${courseId}` };
+        } else {
+          const report = formatCourseFeedbackReport(summary);
+          result = { report, rawData: summary };
+        }
+        break;
+      }
+
+      case 'get_instructor_feedback_summary': {
+        const instructorId = args?.instructor_id as string;
+        const summary = generateInstructorFeedbackSummary(feedbackStore, instructorId);
+
+        if (!summary) {
+          result = { error: `Instructor not found or no courses: ${instructorId}` };
+        } else {
+          const report = formatInstructorFeedbackReport(summary);
+          result = { report, rawData: summary };
+        }
+        break;
+      }
+
+      case 'get_department_feedback_summary': {
+        const department = args?.department as string;
+        const term = args?.term as string | undefined;
+        const year = args?.year as number | undefined;
+
+        const summary = generateDepartmentFeedbackSummary(feedbackStore, department, term, year);
+
+        if (!summary) {
+          result = { error: `Department not found or no courses: ${department}` };
+        } else {
+          const report = formatDepartmentFeedbackReport(summary);
+          result = { report, rawData: summary };
+        }
+        break;
+      }
+
+      case 'get_feedback_trends': {
+        const courseId = args?.course_id as string | undefined;
+        const instructorId = args?.instructor_id as string | undefined;
+        const department = args?.department as string | undefined;
+
+        if (!courseId && !instructorId && !department) {
+          result = { error: 'At least one of course_id, instructor_id, or department must be provided' };
+        } else {
+          const trends = generateFeedbackTrends(feedbackStore, { courseId, instructorId, department });
+          if (!trends) {
+            result = { error: 'No feedback data found for the specified criteria' };
+          } else {
+            result = trends;
+          }
+        }
+        break;
+      }
+
+      case 'list_courses': {
+        const department = args?.department as string | undefined;
+        const term = args?.term as string | undefined;
+        const year = args?.year as number | undefined;
+        const instructorId = args?.instructor_id as string | undefined;
+
+        let courses: Course[];
+
+        if (instructorId) {
+          courses = feedbackStore.getCoursesByInstructor(instructorId);
+        } else if (department) {
+          courses = feedbackStore.getCoursesByDepartment(department, term, year);
+        } else {
+          courses = feedbackStore.getAllCourses();
+        }
+
+        // Apply additional filters
+        if (term && !department) {
+          courses = courses.filter(c => c.term === term);
+        }
+        if (year && !department) {
+          courses = courses.filter(c => c.year === year);
+        }
+
+        result = {
+          totalCourses: courses.length,
+          courses: courses.map(c => ({
+            id: c.id,
+            code: c.code,
+            name: c.name,
+            department: c.department,
+            term: c.term,
+            year: c.year,
+            instructorName: c.instructorName,
+          })),
+        };
+        break;
+      }
+
+      case 'search_feedback': {
+        const queryParams: FeedbackQueryParams = {
+          courseId: args?.course_id as string | undefined,
+          courseCode: args?.course_code as string | undefined,
+          instructorId: args?.instructor_id as string | undefined,
+          department: args?.department as string | undefined,
+          term: args?.term as string | undefined,
+          year: args?.year as number | undefined,
+          minRating: args?.min_rating as number | undefined,
+          maxRating: args?.max_rating as number | undefined,
+          hasComments: args?.has_comments as boolean | undefined,
+          limit: (args?.limit as number) || 100,
+        };
+
+        const feedbackResults = feedbackStore.queryFeedback(queryParams);
+
+        // Anonymize feedback for display
+        const anonymizedResults = feedbackResults.map(fb => ({
+          id: fb.id,
+          courseId: fb.courseId,
+          submittedAt: fb.submittedAt,
+          ratings: fb.ratings,
+          comments: fb.anonymous ? {
+            strengths: fb.comments.strengths,
+            improvements: fb.comments.improvements,
+          } : fb.comments,
+          wouldRecommend: fb.wouldRecommend,
+        }));
+
+        result = {
+          totalResults: anonymizedResults.length,
+          feedback: anonymizedResults,
+        };
+        break;
+      }
+
+      case 'get_feedback_stats': {
+        const stats = {
+          totalCourses: feedbackStore.getTotalCourseCount(),
+          totalFeedbackSubmissions: feedbackStore.getTotalFeedbackCount(),
+          availableTerms: feedbackStore.getAvailableTerms(),
+          availableDepartments: feedbackStore.getAvailableDepartments(),
+          availableInstructors: feedbackStore.getAvailableInstructors(),
+        };
+        result = stats;
+        break;
+      }
+
+      case 'seed_sample_feedback_data': {
+        feedbackStore.seedSampleData();
+        result = {
+          success: true,
+          message: 'Sample feedback data has been seeded successfully',
+          stats: {
+            totalCourses: feedbackStore.getTotalCourseCount(),
+            totalFeedbackSubmissions: feedbackStore.getTotalFeedbackCount(),
+          },
         };
         break;
       }
