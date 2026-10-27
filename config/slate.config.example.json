@@ -1,0 +1,41 @@
+{
+  "baseUrl": "https://apply.greenville.edu",
+  "cacheSeconds": 60,
+  "requestTimeoutSeconds": 60,
+  "suppressBelow": 0,
+
+  "pipeline": {
+    "url": "https://apply.greenville.edu/manage/query/run?id=PASTE-QUERY-GUID&cmd=service&output=json&h=PASTE-TOKEN",
+    "termParam": null,
+    "columns": { "term": "term" },
+    "dimensions": {
+      "student_type": "student_type",
+      "program": "program",
+      "modality": "modality",
+      "state": "state",
+      "county": "county",
+      "sport": "sport",
+      "source": "app_source"
+    },
+    "stages": [
+      { "key": "submitted", "label": "Submitted applications", "column": "submitted_date" },
+      { "key": "completed", "label": "Completed applications", "column": "completed_date" },
+      { "key": "admitted",  "label": "Admitted",               "column": "admit_date" },
+      { "key": "deposited", "label": "Deposited (net)",        "column": "deposit_date",  "netOfCancels": true },
+      { "key": "enrolled",  "label": "Enrolled / registered",  "column": "enrolled_date", "netOfCancels": true }
+    ],
+    "cancelColumn": "withdrawn_date"
+  },
+
+  "queries": {
+    "visit_registrations": {
+      "description": "Campus visit and event registrations by event date and event type (aggregate counts).",
+      "url": "https://apply.greenville.edu/manage/query/run?id=PASTE-QUERY-GUID&cmd=service&output=json&h=PASTE-TOKEN",
+      "params": {
+        "start": { "type": "date", "description": "First event date", "required": true },
+        "end":   { "type": "date", "description": "Last event date",  "required": true }
+      },
+      "maxRows": 500
+    }
+  }
+}

@@ -1,384 +1,183 @@
 /**
- * Slate API Client
- * Handles authentication and data retrieval from Technolutions Slate
+ * Slate query web-service client.
+ *
+ * Slate has no general-purpose data API. Each query you build in Slate's
+ * Query Builder can be exposed as its own web service, with its own URL:
+ *
+ *   https://apply.greenville.edu/manage/query/run?id=<query guid>&cmd=service&output=json&h=<token>
+ *
+ * Access is controlled by the grantees on that query (Edit Permissions ->
+ * Add Grantee -> Web Service). We use a "Username" grantee, so every call also
+ * carries HTTP Basic credentials for a dedicated service account.
+ *
+ * Query @parameters are passed as extra query-string arguments
+ * (e.g. &term=Fall%202026).
  */
 
-import {
-  SlateConfig,
-  StudentRecord,
-  SlateQueryResponse,
-  SlateQueryParams,
-  Demographics,
-  AcademicInfo,
-  GeographicInfo,
-  ApplicationStatus,
-  AdmitType,
-  EnrollmentStatus,
-} from './types.js';
+export interface SlateClientOptions {
+  baseUrl: string;
+  username: string;
+  password: string;
+  cacheSeconds: number;
+  requestTimeoutSeconds: number;
+  fetchImpl?: typeof fetch;
+}
+
+export type SlateRow = Record<string, unknown>;
+
+export interface SlateResult {
+  rows: SlateRow[];
+  fetchedAt: Date;
+  fromCache: boolean;
+}
+
+/** Reserved by Slate; callers may not override these. */
+const RESERVED_PARAMS = new Set(['callback', 'base', 'run', 'query', 'user', 'identity', 'id', 'h', 'output', 'cmd']);
+
+/** Slate allows 300 web-service requests per database per 5 minutes. Stay well under it. */
+const RATE_WINDOW_MS = 5 * 60 * 1000;
+const RATE_LIMIT = 200;
+
+export class SlateError extends Error {
+  constructor(message: string, readonly status?: number) {
+    super(message);
+    this.name = 'SlateError';
+  }
+}
 
 export class SlateClient {
-  private config: SlateConfig;
-  private authHeader: string;
+  private readonly origin: string;
+  private readonly authHeader: string;
+  private readonly fetchImpl: typeof fetch;
+  private readonly cache = new Map<string, { at: number; rows: SlateRow[] }>();
+  private readonly inFlight = new Map<string, Promise<SlateRow[]>>();
+  private readonly callTimes: number[] = [];
 
-  constructor(config: SlateConfig) {
-    this.config = config;
-    // Slate typically uses Basic Auth
-    this.authHeader = 'Basic ' + Buffer.from(
-      `${config.username}:${config.password}`
-    ).toString('base64');
+  constructor(private readonly opts: SlateClientOptions) {
+    this.origin = new URL(opts.baseUrl).origin;
+    this.authHeader = 'Basic ' + Buffer.from(`${opts.username}:${opts.password}`).toString('base64');
+    this.fetchImpl = opts.fetchImpl ?? fetch;
   }
 
   /**
-   * Make an authenticated request to the Slate API
+   * Build the final request URL from a Slate service URL plus parameters.
+   * Refuses to call anything outside the configured Slate host so a bad
+   * config can never send the service-account credentials elsewhere.
    */
-  private async request<T>(
-    endpoint: string,
-    options: RequestInit = {}
-  ): Promise<T> {
-    const url = `${this.config.baseUrl}${endpoint}`;
+  buildUrl(serviceUrl: string, params: Record<string, string | number | boolean | undefined> = {}): URL {
+    const url = new URL(serviceUrl, this.origin + '/');
+    if (url.origin !== this.origin) {
+      throw new SlateError(`Refusing to call ${url.origin}: only ${this.origin} is allowed.`);
+    }
+    if (!url.pathname.startsWith('/manage/')) {
+      throw new SlateError(`Unexpected Slate service path ${url.pathname}; expected a /manage/... query URL.`);
+    }
+    if (!url.searchParams.get('output')) url.searchParams.set('output', 'json');
+    for (const [k, v] of Object.entries(params)) {
+      if (v === undefined || v === '') continue;
+      if (RESERVED_PARAMS.has(k.toLowerCase())) throw new SlateError(`"${k}" is a reserved Slate parameter.`);
+      url.searchParams.set(k, typeof v === 'boolean' ? (v ? '1' : '0') : String(v));
+    }
+    return url;
+  }
 
-    const headers: Record<string, string> = {
-      'Authorization': this.authHeader,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      ...((options.headers as Record<string, string>) || {}),
-    };
-
-    // If API key is provided, use it instead
-    if (this.config.apiKey) {
-      headers['X-API-Key'] = this.config.apiKey;
+  async run(
+    serviceUrl: string,
+    params: Record<string, string | number | boolean | undefined> = {},
+    { fresh = false }: { fresh?: boolean } = {},
+  ): Promise<SlateResult> {
+    const url = this.buildUrl(serviceUrl, params);
+    const key = url.toString();
+    const now = Date.now();
+    const cached = this.cache.get(key);
+    if (!fresh && cached && now - cached.at < this.opts.cacheSeconds * 1000) {
+      return { rows: cached.rows, fetchedAt: new Date(cached.at), fromCache: true };
     }
 
-    const response = await fetch(url, {
-      ...options,
-      headers,
-    });
+    let pending = this.inFlight.get(key);
+    if (!pending) {
+      pending = this.fetchRows(url).finally(() => this.inFlight.delete(key));
+      this.inFlight.set(key, pending);
+    }
+    const rows = await pending;
+    const at = Date.now();
+    this.cache.set(key, { at, rows });
+    return { rows, fetchedAt: new Date(at), fromCache: false };
+  }
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(
-        `Slate API error: ${response.status} ${response.statusText} - ${errorText}`
+  private reserveCall(): void {
+    const now = Date.now();
+    while (this.callTimes.length && now - this.callTimes[0] > RATE_WINDOW_MS) this.callTimes.shift();
+    if (this.callTimes.length >= RATE_LIMIT) {
+      throw new SlateError(
+        'Local safety limit reached (200 Slate web-service calls in 5 minutes). Slate caps each database at 300; wait a few minutes.',
       );
     }
-
-    return response.json() as Promise<T>;
+    this.callTimes.push(now);
   }
 
-  /**
-   * Execute a Slate query to retrieve data
-   * Slate queries are typically defined in the Slate admin panel and exposed via API
-   */
-  async executeQuery<T>(params: SlateQueryParams): Promise<SlateQueryResponse<T>> {
-    const queryParams = new URLSearchParams({
-      cmd: 'query',
-      q: params.query,
-      format: params.format || 'json',
-    });
-
-    if (params.page) {
-      queryParams.append('page', params.page.toString());
-    }
-    if (params.pageSize) {
-      queryParams.append('pageSize', params.pageSize.toString());
-    }
-    if (params.filters) {
-      Object.entries(params.filters).forEach(([key, value]) => {
-        queryParams.append(key, String(value));
+  private async fetchRows(url: URL): Promise<SlateRow[]> {
+    this.reserveCall();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.opts.requestTimeoutSeconds * 1000);
+    let res: Response;
+    try {
+      res = await this.fetchImpl(url, {
+        method: 'GET',
+        headers: { Authorization: this.authHeader, Accept: 'application/json' },
+        signal: controller.signal,
       });
+    } catch (err) {
+      const reason = (err as Error).name === 'AbortError' ? 'timed out' : (err as Error).message;
+      throw new SlateError(`Slate request ${reason} (${redact(url)}).`);
+    } finally {
+      clearTimeout(timer);
     }
 
-    return this.request<SlateQueryResponse<T>>(
-      `/manage/query/run?${queryParams.toString()}`
-    );
-  }
-
-  /**
-   * Get enrolled students for a specific entry year and term
-   */
-  async getEnrolledStudents(
-    entryYear: number,
-    entryTerm?: string
-  ): Promise<StudentRecord[]> {
-    // This query name should match what's configured in your Slate instance
-    // Common query names: enrolled_students, enrollment_census, etc.
-    const queryName = 'enrollment_demographics';
-
-    const filters: Record<string, string | number> = {
-      entry_year: entryYear,
-    };
-
-    if (entryTerm) {
-      filters.entry_term = entryTerm;
+    const text = await res.text();
+    if (res.status === 401 || res.status === 403) {
+      throw new SlateError(
+        `Slate rejected the credentials (${res.status}). Check that the service account is a Web Service grantee on this query and that SLATE_USERNAME/SLATE_PASSWORD are right.`,
+        res.status,
+      );
     }
+    if (res.status === 429) throw new SlateError('Slate web-service rate limit reached (300 calls / 5 min). Try again shortly.', 429);
+    if (!res.ok) throw new SlateError(`Slate returned ${res.status} for ${redact(url)}: ${text.slice(0, 300)}`, res.status);
 
-    const response = await this.executeQuery<RawSlateStudent>({
-      query: queryName,
-      filters,
-    });
-
-    return response.row.map(this.mapToStudentRecord);
-  }
-
-  /**
-   * Get all students by application status
-   */
-  async getStudentsByStatus(
-    status: ApplicationStatus,
-    entryYear?: number
-  ): Promise<StudentRecord[]> {
-    const queryName = 'students_by_status';
-
-    const filters: Record<string, string | number> = {
-      application_status: status,
-    };
-
-    if (entryYear) {
-      filters.entry_year = entryYear;
+    let body: unknown;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      const hint = /<html|<!doctype/i.test(text)
+        ? ' It returned an HTML page, which usually means a login redirect or a URL without cmd=service.'
+        : '';
+      throw new SlateError(`Slate did not return JSON.${hint} Set the query's service type to JSON.`);
     }
-
-    const response = await this.executeQuery<RawSlateStudent>({
-      query: queryName,
-      filters,
-    });
-
-    return response.row.map(this.mapToStudentRecord);
-  }
-
-  /**
-   * Get funnel data (prospects -> applicants -> admitted -> enrolled)
-   */
-  async getFunnelData(entryYear: number, entryTerm?: string): Promise<FunnelData> {
-    const queryName = 'enrollment_funnel';
-
-    const filters: Record<string, string | number> = {
-      entry_year: entryYear,
-    };
-
-    if (entryTerm) {
-      filters.entry_term = entryTerm;
-    }
-
-    const response = await this.executeQuery<RawFunnelData>({
-      query: queryName,
-      filters,
-    });
-
-    // Aggregate funnel data
-    const funnel: FunnelData = {
-      entryYear,
-      entryTerm: entryTerm || 'All',
-      prospects: 0,
-      inquiries: 0,
-      applicants: 0,
-      admitted: 0,
-      deposited: 0,
-      enrolled: 0,
-    };
-
-    for (const row of response.row) {
-      funnel.prospects += row.prospects || 0;
-      funnel.inquiries += row.inquiries || 0;
-      funnel.applicants += row.applicants || 0;
-      funnel.admitted += row.admitted || 0;
-      funnel.deposited += row.deposited || 0;
-      funnel.enrolled += row.enrolled || 0;
-    }
-
-    return funnel;
-  }
-
-  /**
-   * Map raw Slate response to our StudentRecord type
-   */
-  private mapToStudentRecord(raw: RawSlateStudent): StudentRecord {
-    const demographics: Demographics = {
-      gender: raw.gender || raw.sex,
-      ethnicity: raw.ethnicity || raw.ethnic_code,
-      race: raw.race ? (Array.isArray(raw.race) ? raw.race : [raw.race]) : undefined,
-      citizenship: raw.citizenship || raw.citizen,
-      firstGeneration: parseBoolean(raw.first_gen || raw.first_generation),
-      legacyStatus: parseBoolean(raw.legacy || raw.legacy_status),
-      veteranStatus: parseBoolean(raw.veteran || raw.veteran_status),
-      dateOfBirth: raw.birth_date || raw.dob,
-    };
-
-    const academicInfo: AcademicInfo = {
-      intendedMajor: raw.major || raw.intended_major || raw.major_1,
-      intendedCollege: raw.college || raw.intended_college,
-      highSchoolGPA: parseFloat(raw.hs_gpa || raw.high_school_gpa) || undefined,
-      transferGPA: parseFloat(raw.transfer_gpa) || undefined,
-      testScores: {
-        satTotal: parseInt(raw.sat_total || raw.sat_composite) || undefined,
-        satMath: parseInt(raw.sat_math) || undefined,
-        satVerbal: parseInt(raw.sat_verbal || raw.sat_ebrw) || undefined,
-        actComposite: parseInt(raw.act_composite || raw.act) || undefined,
-      },
-      highSchoolName: raw.hs_name || raw.high_school_name,
-      highSchoolCity: raw.hs_city || raw.high_school_city,
-      highSchoolState: raw.hs_state || raw.high_school_state,
-    };
-
-    const geographicInfo: GeographicInfo = {
-      city: raw.city || raw.home_city,
-      state: raw.state || raw.home_state || raw.region,
-      country: raw.country || raw.home_country || 'USA',
-      zipCode: raw.zip || raw.postal_code || raw.zip_code,
-      region: raw.geo_region || raw.territory,
-      isInternational: (raw.country && raw.country !== 'USA' && raw.country !== 'United States') ||
-        parseBoolean(raw.international) || false,
-    };
-
-    return {
-      id: raw.id || raw.ref || raw.guid,
-      firstName: raw.first || raw.first_name || raw.fname,
-      lastName: raw.last || raw.last_name || raw.lname,
-      email: raw.email || raw.email_address,
-      applicationStatus: mapApplicationStatus(raw.app_status || raw.application_status || raw.status),
-      admitType: mapAdmitType(raw.admit_type || raw.student_type || raw.level),
-      enrollmentStatus: mapEnrollmentStatus(raw.enrollment_status || raw.enroll_status),
-      entryTerm: raw.entry_term || raw.term || raw.admit_term,
-      entryYear: parseInt(raw.entry_year || raw.year || raw.admit_year) || new Date().getFullYear(),
-      demographics,
-      academicInfo,
-      geographicInfo,
-    };
+    return extractRows(body);
   }
 }
 
-// Raw Slate data types (field names vary by institution)
-interface RawSlateStudent {
-  id?: string;
-  ref?: string;
-  guid?: string;
-  first?: string;
-  first_name?: string;
-  fname?: string;
-  last?: string;
-  last_name?: string;
-  lname?: string;
-  email?: string;
-  email_address?: string;
-  gender?: string;
-  sex?: string;
-  ethnicity?: string;
-  ethnic_code?: string;
-  race?: string | string[];
-  citizenship?: string;
-  citizen?: string;
-  first_gen?: string;
-  first_generation?: string;
-  legacy?: string;
-  legacy_status?: string;
-  veteran?: string;
-  veteran_status?: string;
-  birth_date?: string;
-  dob?: string;
-  major?: string;
-  intended_major?: string;
-  major_1?: string;
-  college?: string;
-  intended_college?: string;
-  hs_gpa?: string;
-  high_school_gpa?: string;
-  transfer_gpa?: string;
-  sat_total?: string;
-  sat_composite?: string;
-  sat_math?: string;
-  sat_verbal?: string;
-  sat_ebrw?: string;
-  act_composite?: string;
-  act?: string;
-  hs_name?: string;
-  high_school_name?: string;
-  hs_city?: string;
-  high_school_city?: string;
-  hs_state?: string;
-  high_school_state?: string;
-  city?: string;
-  home_city?: string;
-  state?: string;
-  home_state?: string;
-  region?: string;
-  country?: string;
-  home_country?: string;
-  zip?: string;
-  postal_code?: string;
-  zip_code?: string;
-  geo_region?: string;
-  territory?: string;
-  international?: string;
-  app_status?: string;
-  application_status?: string;
-  status?: string;
-  admit_type?: string;
-  student_type?: string;
-  level?: string;
-  enrollment_status?: string;
-  enroll_status?: string;
-  entry_term?: string;
-  term?: string;
-  admit_term?: string;
-  entry_year?: string;
-  year?: string;
-  admit_year?: string;
+/** Slate JSON services return {"row": [...]} (a single row may come back as an object). */
+export function extractRows(body: unknown): SlateRow[] {
+  if (body === null || body === undefined) return [];
+  if (Array.isArray(body)) return body as SlateRow[];
+  if (typeof body === 'object') {
+    const b = body as Record<string, unknown>;
+    for (const k of ['row', 'rows', 'data', 'results']) {
+      if (k in b) {
+        const v = b[k];
+        if (Array.isArray(v)) return v as SlateRow[];
+        if (v && typeof v === 'object') return [v as SlateRow];
+        return [];
+      }
+    }
+  }
+  throw new SlateError('Unrecognized Slate JSON shape (expected {"row": [...]}).');
 }
 
-interface RawFunnelData {
-  prospects?: number;
-  inquiries?: number;
-  applicants?: number;
-  admitted?: number;
-  deposited?: number;
-  enrolled?: number;
-}
-
-export interface FunnelData {
-  entryYear: number;
-  entryTerm: string;
-  prospects: number;
-  inquiries: number;
-  applicants: number;
-  admitted: number;
-  deposited: number;
-  enrolled: number;
-}
-
-// Helper functions
-function parseBoolean(value: string | boolean | undefined): boolean | undefined {
-  if (value === undefined || value === null || value === '') return undefined;
-  if (typeof value === 'boolean') return value;
-  const lower = value.toLowerCase();
-  return lower === 'true' || lower === 'yes' || lower === 'y' || lower === '1';
-}
-
-function mapApplicationStatus(status: string | undefined): ApplicationStatus {
-  if (!status) return 'prospect';
-  const lower = status.toLowerCase();
-  if (lower.includes('admit') || lower.includes('accepted')) return 'admitted';
-  if (lower.includes('deny') || lower.includes('denied') || lower.includes('reject')) return 'denied';
-  if (lower.includes('wait')) return 'waitlisted';
-  if (lower.includes('withdraw')) return 'withdrawn';
-  if (lower.includes('appl') || lower.includes('complete')) return 'applicant';
-  if (lower.includes('inquir')) return 'inquiry';
-  return 'prospect';
-}
-
-function mapAdmitType(type: string | undefined): AdmitType {
-  if (!type) return 'freshman';
-  const lower = type.toLowerCase();
-  if (lower.includes('transfer') || lower.includes('tr')) return 'transfer';
-  if (lower.includes('grad')) return 'graduate';
-  if (lower.includes('readmit')) return 'readmit';
-  if (lower.includes('non') && lower.includes('degree')) return 'non-degree';
-  return 'freshman';
-}
-
-function mapEnrollmentStatus(status: string | undefined): EnrollmentStatus {
-  if (!status) return 'not_enrolled';
-  const lower = status.toLowerCase();
-  if (lower.includes('enroll') && !lower.includes('not')) return 'enrolled';
-  if (lower.includes('deposit')) return 'deposited';
-  if (lower.includes('defer')) return 'deferred';
-  if (lower.includes('withdraw')) return 'withdrawn';
-  return 'not_enrolled';
+/** Hide the h= token when a URL shows up in an error message. */
+export function redact(url: URL): string {
+  const u = new URL(url.toString());
+  if (u.searchParams.has('h')) u.searchParams.set('h', '***');
+  return u.toString();
 }

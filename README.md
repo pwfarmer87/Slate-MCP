@@ -1,240 +1,119 @@
-# Slate MCP Server
+# Slate Enrollment MCP Server (v2)
 
-An MCP (Model Context Protocol) server that connects [Technolutions Slate](https://technolutions.com/slate) with Claude, enabling you to query and analyze student enrollment demographics data through natural language.
+This server gives Claude **real-time, read-only enrollment pipeline data** from Greenville University's Slate instance (`apply.greenville.edu`). With it, Claude can answer questions and build dashboards such as:
 
-## Features
+- "Where are we on Fall 2027 deposits today versus this day last year?"
+- "Break down admits and deposits by program, with last year alongside."
+- "Chart weekly net deposits for Fall 2027 against Fall 2026."
+- "Build a dashboard of the Fall 2027 funnel for First-Year students from Illinois."
 
-- **Enrollment Demographics**: Get comprehensive demographic summaries for incoming classes
-- **Diversity Metrics**: Calculate diversity indices, URM percentages, and geographic diversity
-- **Enrollment Funnel**: Track conversion rates from prospect to enrolled
-- **Year-over-Year Comparisons**: Analyze trends across multiple enrollment years
-- **Flexible Queries**: Search and filter students by various criteria
+## What changed from v1
 
-## Prerequisites
+v1 called a generic `/manage/query/run?cmd=query&q=<name>` endpoint with an `X-API-Key` header. Slate doesn't work that way. In Slate, each query is published as its **own web service** with its own URL (`...?id=<guid>&cmd=service&output=json&h=<token>`), and access is granted per query. v2 is rebuilt around that model:
 
-- Node.js 18.0.0 or higher
-- Access to a Technolutions Slate instance with API credentials
-- Slate queries configured for enrollment data (see [Slate Configuration](#slate-configuration))
+| | v1 | v2 |
+|---|---|---|
+| Slate access | Generic endpoint by query name, so it never worked | Exact per-query service URLs copied from Slate |
+| Auth | Basic auth plus an invented API-key header | "Username" Web Service grantee (Basic auth) and the `h` token |
+| Data pulled | Full student records with names, emails and demographics | One lean query of **milestone dates and grouping fields only**, with no PII |
+| As-of / YoY | Not supported | Any as-of date is rebuilt from milestone dates, including same day last year |
+| Slate load | One call per question | 60-second cache, in-flight dedupe, and a local 200-calls-per-5-minutes cap (Slate allows 300) |
+| Safety | None | Calls only the configured Slate host, runs only allowlisted queries, rejects unknown params and filters, optional small-cell suppression |
+| Transport | stdio | stdio, plus Streamable HTTP with a bearer token for a shared server |
+| Tests | None | 31 end-to-end checks against a fake Slate service, over both transports |
 
-## Installation
+## Tools
 
-```bash
-# Clone the repository
-git clone https://github.com/your-org/slate-mcp-server.git
-cd slate-mcp-server
+| Tool | Purpose |
+|---|---|
+| `describe_pipeline` | Lists stages, dimensions, terms and common values. Claude calls this first. |
+| `enrollment_snapshot` | Funnel counts for a term as of any date, with conversion rates and filters. |
+| `enrollment_compare` | Same-day year-over-year comparison by stage, with change and % change. |
+| `enrollment_breakdown` | Funnel by program, student type, state, sport, etc., optionally with the prior year. |
+| `enrollment_pace` | Daily or weekly cumulative curve for one stage against the prior year. Good for pace charts. |
+| `list_slate_queries` / `run_slate_query` | Run extra Slate queries you've allowlisted in the config, such as visit registrations. |
 
-# Install dependencies
-npm install
+All tools are read-only. No tool returns an individual student.
 
-# Build the project
-npm run build
-```
+## Setup
 
-## Configuration
+1. **Slate side.** Build the pipeline query and grant the service account. Follow [docs/SLATE_SETUP.md](docs/SLATE_SETUP.md); it takes about 30–60 minutes for a Slate admin.
 
-### Environment Variables
+2. **Install:**
 
-Copy `.env.example` to `.env` and configure your Slate credentials:
+   ```bash
+   npm install
+   npm run build
+   cp config/slate.config.example.json config/slate.config.json   # paste your query URLs
+   cp .env.example .env                                           # service account credentials
+   ```
 
-```bash
-cp .env.example .env
-```
+3. **Check:**
 
-Required environment variables:
+   ```bash
+   npm run check:slate -- "Fall 2027"
+   ```
 
-| Variable | Description |
-|----------|-------------|
-| `SLATE_BASE_URL` | Your Slate instance URL (e.g., `https://yourschool.technolutions.net`) |
-| `SLATE_USERNAME` | Slate API username |
-| `SLATE_PASSWORD` | Slate API password |
-| `SLATE_API_KEY` | (Optional) API key if your instance uses key-based auth |
+### Connect Claude
 
-### Claude Desktop Configuration
-
-Add the server to your Claude Desktop configuration file:
-
-**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+**Claude Desktop (one machine, stdio).** Edit `claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "slate": {
       "command": "node",
-      "args": ["/path/to/slate-mcp-server/dist/index.js"],
+      "args": ["C:/path/to/slate-mcp/dist/index.js"],
       "env": {
-        "SLATE_BASE_URL": "https://yourschool.technolutions.net",
-        "SLATE_USERNAME": "your_username",
-        "SLATE_PASSWORD": "your_password"
+        "SLATE_CONFIG": "C:/path/to/slate-mcp/config/slate.config.json",
+        "SLATE_USERNAME": "svc-claude-mcp",
+        "SLATE_PASSWORD": "…"
       }
     }
   }
 }
 ```
 
-## Slate Configuration
+**Claude Code:**
 
-This MCP server expects certain queries to be configured in your Slate instance. Work with your Slate administrator to create these queries:
-
-### Required Queries
-
-1. **`enrollment_demographics`**: Returns enrolled student data with demographics
-   - Required fields: `id`, `first_name`, `last_name`, `email`, `gender`, `ethnicity`, `race`, `citizenship`, `first_generation`, `state`, `country`, `intended_major`, `entry_year`, `entry_term`, `enrollment_status`
-
-2. **`enrollment_funnel`**: Returns funnel counts
-   - Required fields: `prospects`, `inquiries`, `applicants`, `admitted`, `deposited`, `enrolled`
-
-3. **`students_by_status`**: Returns students filtered by application status
-   - Required fields: Same as `enrollment_demographics`
-
-### Query Parameters
-
-The server will pass these parameters to your queries:
-- `entry_year`: The enrollment year (e.g., 2024)
-- `entry_term`: The enrollment term (e.g., "Fall")
-- `application_status`: For status-based queries
-
-## Available Tools
-
-### `get_enrollment_demographics`
-
-Get a comprehensive demographics summary for enrolled students.
-
-**Parameters:**
-- `entry_year` (required): The entry year (e.g., 2024)
-- `entry_term` (optional): The entry term (default: "Fall")
-
-**Example prompt:** "Show me the demographics for Fall 2024 incoming class"
-
-### `get_diversity_metrics`
-
-Get detailed diversity metrics including diversity index and URM percentages.
-
-**Parameters:**
-- `entry_year` (required): The entry year
-- `entry_term` (optional): The entry term
-
-**Example prompt:** "What are the diversity metrics for our 2024 freshman class?"
-
-### `get_enrollment_funnel`
-
-Get enrollment funnel data with conversion rates.
-
-**Parameters:**
-- `entry_year` (required): The entry year
-- `entry_term` (optional): The entry term
-
-**Example prompt:** "Show me the enrollment funnel and yield rates for Fall 2024"
-
-### `compare_enrollment_years`
-
-Compare demographics across multiple years.
-
-**Parameters:**
-- `years` (required): Array of years to compare (e.g., [2022, 2023, 2024])
-- `entry_term` (optional): The entry term
-
-**Example prompt:** "Compare enrollment demographics from 2022 to 2024"
-
-### `get_demographics_report`
-
-Generate a formatted, readable demographics report.
-
-**Parameters:**
-- `entry_year` (required): The entry year
-- `entry_term` (optional): The entry term
-
-**Example prompt:** "Generate a demographics report for Fall 2024"
-
-### `get_demographics_by_category`
-
-Get enrollment breakdown by a specific category.
-
-**Parameters:**
-- `entry_year` (required): The entry year
-- `category` (required): One of: `gender`, `ethnicity`, `state`, `country`, `admit_type`, `major`, `college`, `first_generation`, `international`
-- `entry_term` (optional): The entry term
-
-**Example prompt:** "Show me enrollment by state for Fall 2024"
-
-### `search_students`
-
-Search for students matching specific criteria.
-
-**Parameters:**
-- `entry_year` (optional): Filter by entry year
-- `entry_term` (optional): Filter by entry term
-- `state` (optional): Filter by home state
-- `country` (optional): Filter by home country
-- `major` (optional): Filter by intended major
-- `first_generation` (optional): Filter by first-gen status
-- `international` (optional): Filter by international status
-- `limit` (optional): Max results (default: 100)
-
-**Example prompt:** "Find all first-generation students from California in Fall 2024"
-
-## Example Conversations
-
-### Getting Annual Demographics Report
-
-```
-User: What does our incoming Fall 2024 class look like demographically?
-
-Claude: I'll pull the enrollment demographics for Fall 2024...
-[Uses get_enrollment_demographics tool]
-
-Here's a summary of your Fall 2024 incoming class:
-- Total Enrolled: 2,450 students
-- Gender: 54% Female, 45% Male, 1% Non-binary
-- First Generation: 28% (686 students)
-- International: 12% (294 students)
-...
+```bash
+claude mcp add slate --env SLATE_CONFIG=/path/config/slate.config.json \
+  --env SLATE_USERNAME=svc-claude-mcp --env SLATE_PASSWORD=… \
+  -- node /path/to/slate-mcp/dist/index.js
 ```
 
-### Year-over-Year Analysis
+**Shared server (enrollment team).** This keeps the Slate credentials on one GU server instead of everyone's laptop:
 
+```bash
+MCP_AUTH_TOKEN=$(openssl rand -hex 32) PORT=8787 npm run start:http
 ```
-User: How has our diversity changed over the past 3 years?
 
-Claude: I'll compare the demographics across 2022, 2023, and 2024...
-[Uses compare_enrollment_years tool]
+This serves `http://127.0.0.1:8787/mcp`, which requires `Authorization: Bearer <token>`, plus a health check at `/healthz`. Put it behind HTTPS (IIS reverse proxy, nginx, or a Cloudflare Tunnel) before exposing it. Rolling it out as a claude.ai custom connector for the whole team means adding OAuth in front, for example through an identity-aware proxy tied to your Microsoft/Google sign-in. That is the recommended next step once the numbers are validated.
 
-Here's the year-over-year comparison:
-- First Generation: 24% → 26% → 28% (+4 points)
-- International: 10% → 11% → 12% (+2 points)
-- URM: 22% → 24% → 26% (+4 points)
-...
-```
+## Configuration reference
+
+`config/slate.config.json`:
+
+- `baseUrl`: `https://apply.greenville.edu`. The server refuses to call any other host.
+- `cacheSeconds`: how long a Slate pull is reused (default 60). "Real time" means at most this old. Pass `fresh: true` on any tool to re-query immediately.
+- `suppressBelow`: report counts from 1 to N-1 as `<N`. Use 5 or 10 if summaries will be shared beyond enrollment staff.
+- `pipeline.stages`: an ordered list of `{key, label, column, netOfCancels}`. Change these to match GU's funnel definitions.
+- `pipeline.dimensions`: maps a dimension name to a query column. Every dimension can be used as a filter and as a breakdown.
+- `pipeline.cancelColumn`: the withdraw/cancel/melt date, used for net counts.
+- `queries`: extra allowlisted Slate queries, each with typed parameters, `maxRows` and `dropColumns`.
+
+Secrets come only from the environment: `SLATE_USERNAME`, `SLATE_PASSWORD`, `MCP_AUTH_TOKEN`, and optionally `SLATE_PIPELINE_URL`.
+
+## Data governance
+
+- The pipeline query exports **no direct identifiers**, only dates and grouping fields. `check:slate` warns if PII-looking columns show up.
+- Tool results enter the model's context. Use a Claude plan with commercial data terms, and agree with the Registrar and IR on which dimensions are appropriate. Small programs combined with state and sport can become identifying; use `suppressBelow` if needed.
+- The service account should be a grantee on these queries only, with no other Slate permissions.
 
 ## Development
 
 ```bash
-# Run in development mode
-npm run dev
-
-# Type check
 npm run typecheck
-
-# Lint
-npm run lint
-
-# Build
-npm run build
+npm test        # fake Slate + real MCP client over stdio and HTTP
+npm run dev     # run from source
 ```
-
-## Security Considerations
-
-- Never commit `.env` files containing credentials
-- Use read-only API credentials when possible
-- The server anonymizes personally identifiable information in search results
-- Consider implementing rate limiting for production use
-
-## License
-
-MIT
-
-## Support
-
-For issues with this MCP server, please open a GitHub issue.
-
-For Slate-specific questions, contact [Technolutions Support](https://technolutions.com/support).

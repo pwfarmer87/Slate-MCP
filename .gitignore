@@ -28,3 +28,6 @@ coverage/
 
 # TypeScript cache
 *.tsbuildinfo
+
+# Real Slate config (contains query tokens)
+config/slate.config.json
